@@ -1,322 +1,234 @@
+#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import * as z from "zod/v4";
 import { NewRelicClient } from "./newrelic-client.js";
 
-const server = new McpServer({
-  name: "newrelic-mcp",
-  version: "1.0.0",
-});
+// ── NRQL helpers ───────────────────────────────────────────────────────────
+
+function escapeNrql(value: string): string {
+  return value.replace(/[\x00-\x1f]/g, "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+function whereAppName(appName?: string): string {
+  return appName ? `WHERE appName = '${escapeNrql(appName)}'` : "";
+}
+
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function nrqlHandler<T>(buildQuery: (params: T) => string): (params: T) => Promise<any> {
+  return async (params) => {
+    try {
+      const result = await client.nrql(buildQuery(params));
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${errorMessage(e)}` }], isError: true };
+    }
+  };
+}
+
+const sinceSchema = z
+  .string()
+  .regex(
+    /^[1-9]\d{0,3} (minute|minutes|hour|hours|day|days|week|weeks|month|months) ago$/,
+    "Must be a relative time like '1 hour ago', '30 minutes ago', '7 days ago'",
+  );
+
+const limitSchema = z.number().int().min(1).max(200);
+
+// ── Server setup ───────────────────────────────────────────────────────────
+
+const server = new McpServer(
+  {
+    name: "newrelic-mcp",
+    version: "1.0.0",
+  },
+  {
+    capabilities: {},
+  },
+);
 
 let client: NewRelicClient;
 
 try {
   client = new NewRelicClient();
-} catch (e: any) {
-  console.error(`Failed to initialize New Relic client: ${e.message}`);
+} catch (e) {
+  console.error(`Failed to initialize New Relic client: ${errorMessage(e)}`);
   process.exit(1);
 }
 
-// ── Tool: Run arbitrary NRQL query ──────────────────────────────────────────
+// ── Tools ──────────────────────────────────────────────────────────────────
 
-server.tool(
+server.registerTool(
   "query_nrql",
-  "Run an arbitrary NRQL query against New Relic. Use this for any custom metric exploration.",
-  { query: z.string().describe("The NRQL query to execute") },
-  async ({ query }) => {
-    try {
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
+  {
+    title: "Query NRQL",
+    description: "Run an arbitrary NRQL query against New Relic. Use this for any custom metric exploration.",
+    inputSchema: z.object({
+      query: z.string().describe("The NRQL query to execute"),
+    }),
+    annotations: { readOnlyHint: true, openWorldHint: true },
   },
+  nrqlHandler(({ query }) => query),
 );
 
-// ── Tool: Get recent errors ─────────────────────────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_errors",
-  "Get recent application errors/exceptions from New Relic. Returns error class, message, count, and transaction name.",
   {
-    app_name: z
-      .string()
-      .optional()
-      .describe("Filter by app name (default: all apps)"),
-    since: z
-      .string()
-      .default("1 hour ago")
-      .describe("Time range, e.g. '1 hour ago', '1 day ago', '1 week ago'"),
-    limit: z.number().default(25).describe("Max number of errors to return"),
+    title: "Get Errors",
+    description: "Get recent application errors/exceptions from New Relic. Returns error class, message, count, and transaction name.",
+    inputSchema: z.object({
+      app_name: z.string().optional().describe("Filter by app name (default: all apps)"),
+      since: sinceSchema.default("1 hour ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+      limit: limitSchema.default(25).describe("Max number of errors to return (1-200)"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ app_name, since, limit }) => {
-    try {
-      const whereClause = app_name ? `WHERE appName = '${app_name}'` : "";
-      const query = `SELECT count(*), latest(error.message), latest(transactionName) FROM TransactionError ${whereClause} FACET error.class SINCE ${since} LIMIT ${limit}`;
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ app_name, since, limit }) =>
+    `SELECT count(*), latest(error.message), latest(transactionName) FROM TransactionError ${whereAppName(app_name)} FACET error.class SINCE ${since} LIMIT ${limit}`,
+  ),
 );
 
-// ── Tool: Get slow transactions ─────────────────────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_slow_transactions",
-  "Get the slowest HTTP transactions. Useful for identifying performance bottlenecks.",
   {
-    app_name: z
-      .string()
-      .optional()
-      .describe("Filter by app name (default: all apps)"),
-    since: z
-      .string()
-      .default("1 hour ago")
-      .describe("Time range, e.g. '1 hour ago', '1 day ago'"),
-    limit: z.number().default(20).describe("Max number of transactions to return"),
+    title: "Get Slow Transactions",
+    description: "Get the slowest HTTP transactions. Useful for identifying performance bottlenecks.",
+    inputSchema: z.object({
+      app_name: z.string().optional().describe("Filter by app name (default: all apps)"),
+      since: sinceSchema.default("1 hour ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+      limit: limitSchema.default(20).describe("Max number of transactions to return (1-200)"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ app_name, since, limit }) => {
-    try {
-      const whereClause = app_name ? `WHERE appName = '${app_name}'` : "";
-      const query = `SELECT average(duration), max(duration), count(*), percentile(duration, 95) FROM Transaction ${whereClause} FACET name SINCE ${since} LIMIT ${limit} ORDER BY average(duration) DESC`;
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ app_name, since, limit }) =>
+    `SELECT average(duration), max(duration), count(*), percentile(duration, 95) FROM Transaction ${whereAppName(app_name)} FACET name SINCE ${since} LIMIT ${limit} ORDER BY average(duration) DESC`,
+  ),
 );
 
-// ── Tool: Get throughput overview ────────────────────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_throughput",
-  "Get request throughput (requests/min) and error rate overview.",
   {
-    app_name: z
-      .string()
-      .optional()
-      .describe("Filter by app name (default: all apps)"),
-    since: z
-      .string()
-      .default("1 hour ago")
-      .describe("Time range, e.g. '1 hour ago', '1 day ago'"),
+    title: "Get Throughput",
+    description: "Get request throughput (requests/min) and error rate overview.",
+    inputSchema: z.object({
+      app_name: z.string().optional().describe("Filter by app name (default: all apps)"),
+      since: sinceSchema.default("1 hour ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ app_name, since }) => {
-    try {
-      const whereClause = app_name ? `WHERE appName = '${app_name}'` : "";
-      const query = `SELECT rate(count(*), 1 minute) AS 'rpm', percentage(count(*), WHERE error IS true) AS 'error_rate', average(duration) AS 'avg_duration', percentile(duration, 95) AS 'p95' FROM Transaction ${whereClause} SINCE ${since} TIMESERIES AUTO`;
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ app_name, since }) =>
+    `SELECT rate(count(*), 1 minute) AS 'rpm', percentage(count(*), WHERE error IS true) AS 'error_rate', average(duration) AS 'avg_duration', percentile(duration, 95) AS 'p95' FROM Transaction ${whereAppName(app_name)} SINCE ${since} TIMESERIES AUTO`,
+  ),
 );
 
-// ── Tool: Get active alerts ─────────────────────────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_alerts",
-  "Get active/recent alert incidents from New Relic.",
   {
-    since: z
-      .string()
-      .default("1 day ago")
-      .describe("Time range, e.g. '1 hour ago', '1 day ago'"),
+    title: "Get Alert Incidents",
+    description: "Get recent alert incidents from New Relic. Returns incident title, priority, state, and timestamps.",
+    inputSchema: z.object({
+      since: sinceSchema.default("1 day ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ since }) => {
-    try {
-      const gql = `
-        {
-          actor {
-            account(id: ${client.getAccountId()}) {
-              nrql(query: "SELECT * FROM NrAiIncident SINCE ${since} LIMIT 50") {
-                results
-              }
-            }
-          }
-        }
-      `;
-      const result = await client.query(gql);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ since }) =>
+    `SELECT timestamp, title, priority, state, conditionName, policyName FROM NrAiIncident SINCE ${since} LIMIT 50`,
+  ),
 );
 
-// ── Tool: Get database performance ──────────────────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_database_performance",
-  "Get slow database queries and their performance metrics. Useful for identifying DB bottlenecks.",
   {
-    app_name: z
-      .string()
-      .optional()
-      .describe("Filter by app name (default: all apps)"),
-    since: z
-      .string()
-      .default("1 hour ago")
-      .describe("Time range, e.g. '1 hour ago', '1 day ago'"),
-    limit: z.number().default(20).describe("Max number of queries to return"),
+    title: "Get Database Performance",
+    description: "Get transactions with the highest database time. Useful for identifying which endpoints spend the most time in DB calls.",
+    inputSchema: z.object({
+      app_name: z.string().optional().describe("Filter by app name (default: all apps)"),
+      since: sinceSchema.default("1 hour ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+      limit: limitSchema.default(20).describe("Max number of transactions to return (1-200)"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ app_name, since, limit }) => {
-    try {
-      const whereClause = app_name ? `WHERE appName = '${app_name}'` : "";
-      const query = `SELECT average(databaseDuration), max(databaseDuration), count(*) FROM Transaction ${whereClause} FACET name SINCE ${since} LIMIT ${limit} ORDER BY average(databaseDuration) DESC`;
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ app_name, since, limit }) =>
+    `SELECT average(databaseDuration), max(databaseDuration), count(*) FROM Transaction ${whereAppName(app_name)} FACET name SINCE ${since} LIMIT ${limit} ORDER BY average(databaseDuration) DESC`,
+  ),
 );
 
-// ── Tool: Get HTTP status code breakdown ────────────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_http_status_breakdown",
-  "Get a breakdown of HTTP response status codes. Useful for spotting 4xx/5xx spikes.",
   {
-    app_name: z
-      .string()
-      .optional()
-      .describe("Filter by app name (default: all apps)"),
-    since: z
-      .string()
-      .default("1 hour ago")
-      .describe("Time range, e.g. '1 hour ago', '1 day ago'"),
+    title: "Get HTTP Status Breakdown",
+    description: "Get a breakdown of HTTP response status codes. Useful for spotting 4xx/5xx spikes.",
+    inputSchema: z.object({
+      app_name: z.string().optional().describe("Filter by app name (default: all apps)"),
+      since: sinceSchema.default("1 hour ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ app_name, since }) => {
-    try {
-      const whereClause = app_name ? `WHERE appName = '${app_name}'` : "";
-      const query = `SELECT count(*) FROM Transaction ${whereClause} FACET http.statusCode SINCE ${since}`;
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ app_name, since }) =>
+    `SELECT count(*) FROM Transaction ${whereAppName(app_name)} FACET http.statusCode SINCE ${since}`,
+  ),
 );
 
-// ── Tool: Get error details with stack traces ───────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_error_details",
-  "Get detailed error information including stack traces for a specific error class or transaction.",
   {
-    error_class: z
-      .string()
-      .optional()
-      .describe("Filter by error class name"),
-    transaction_name: z
-      .string()
-      .optional()
-      .describe("Filter by transaction/endpoint name"),
-    since: z
-      .string()
-      .default("1 hour ago")
-      .describe("Time range"),
-    limit: z.number().default(10).describe("Max number of error traces"),
+    title: "Get Error Details",
+    description: "Get detailed error information including stack traces for a specific error class or transaction.",
+    inputSchema: z.object({
+      error_class: z.string().optional().describe("Filter by error class name"),
+      transaction_name: z.string().optional().describe("Filter by transaction/endpoint name"),
+      since: sinceSchema.default("1 hour ago").describe("Time range"),
+      limit: limitSchema.default(10).describe("Max number of error traces (1-200)"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ error_class, transaction_name, since, limit }) => {
-    try {
-      const conditions: string[] = [];
-      if (error_class) conditions.push(`error.class = '${error_class}'`);
-      if (transaction_name) conditions.push(`transactionName = '${transaction_name}'`);
-      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-
-      const query = `SELECT timestamp, error.class, error.message, transactionName, error.stack, request.uri, request.method FROM TransactionError ${whereClause} SINCE ${since} LIMIT ${limit}`;
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ error_class, transaction_name, since, limit }) => {
+    const conditions: string[] = [];
+    if (error_class) conditions.push(`error.class = '${escapeNrql(error_class)}'`);
+    if (transaction_name) conditions.push(`transactionName = '${escapeNrql(transaction_name)}'`);
+    const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    return `SELECT timestamp, error.class, error.message, transactionName, error.stack, request.uri, request.method FROM TransactionError ${whereClause} SINCE ${since} LIMIT ${limit}`;
+  }),
 );
 
-// ── Tool: Get app overview / health ─────────────────────────────────────────
-
-server.tool(
+server.registerTool(
   "get_app_health",
-  "Get a quick health overview of the application: throughput, error rate, response time, and Apdex.",
   {
-    app_name: z
-      .string()
-      .optional()
-      .describe("Filter by app name (default: all apps)"),
-    since: z
-      .string()
-      .default("30 minutes ago")
-      .describe("Time range"),
+    title: "Get App Health",
+    description: "Get a quick health overview of the application: throughput, error rate, response time, and Apdex.",
+    inputSchema: z.object({
+      app_name: z.string().optional().describe("Filter by app name (default: all apps)"),
+      since: sinceSchema.default("30 minutes ago").describe("Time range"),
+    }),
+    annotations: { readOnlyHint: true },
   },
-  async ({ app_name, since }) => {
-    try {
-      const whereClause = app_name ? `WHERE appName = '${app_name}'` : "";
-      const query = `SELECT count(*) AS 'total_requests', rate(count(*), 1 minute) AS 'rpm', percentage(count(*), WHERE error IS true) AS 'error_rate_pct', average(duration) AS 'avg_response_s', percentile(duration, 50, 95, 99) AS 'percentiles', apdex(duration, 0.5) AS 'apdex' FROM Transaction ${whereClause} SINCE ${since}`;
-      const result = await client.nrql(query);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (e: any) {
-      return {
-        content: [{ type: "text" as const, text: `Error: ${e.message}` }],
-        isError: true,
-      };
-    }
-  },
+  nrqlHandler(({ app_name, since }) =>
+    `SELECT count(*) AS 'total_requests', rate(count(*), 1 minute) AS 'rpm', percentage(count(*), WHERE error IS true) AS 'error_rate_pct', average(duration) AS 'avg_response_s', percentile(duration, 50, 95, 99) AS 'percentiles', apdex(duration, 0.5) AS 'apdex' FROM Transaction ${whereAppName(app_name)} SINCE ${since}`,
+  ),
 );
 
-// ── Start server ────────────────────────────────────────────────────────────
+// ── Start server ───────────────────────────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
+
+async function shutdown() {
+  try {
+    await server.close();
+  } catch {
+    // best-effort cleanup
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 main().catch((e) => {
   console.error(e);
