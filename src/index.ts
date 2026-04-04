@@ -105,7 +105,7 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   nrqlHandler(({ app_name, since, limit }) =>
-    `SELECT average(duration), max(duration), count(*), percentile(duration, 95) FROM Transaction ${whereAppName(app_name)} FACET name SINCE ${since} LIMIT ${limit} ORDER BY average(duration) DESC`,
+    `SELECT average(duration), max(duration), count(*), percentile(duration, 95) FROM Transaction ${whereAppName(app_name)} FACET name ORDER BY average(duration) DESC SINCE ${since} LIMIT ${limit}`,
   ),
 );
 
@@ -153,7 +153,7 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   nrqlHandler(({ app_name, since, limit }) =>
-    `SELECT average(databaseDuration), max(databaseDuration), count(*) FROM Transaction ${whereAppName(app_name)} FACET name SINCE ${since} LIMIT ${limit} ORDER BY average(databaseDuration) DESC`,
+    `SELECT average(databaseDuration), max(databaseDuration), count(*) FROM Transaction ${whereAppName(app_name)} FACET name ORDER BY average(databaseDuration) DESC SINCE ${since} LIMIT ${limit}`,
   ),
 );
 
