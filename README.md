@@ -16,6 +16,16 @@ An [MCP](https://modelcontextprotocol.io) server that gives AI assistants access
 | `get_http_status_breakdown` | HTTP status code distribution |
 | `get_alerts` | Recent alert incidents with title, priority, and state |
 
+### Vercel apps (log drain)
+
+For Vercel projects whose runtime logs reach New Relic through a [Vercel log drain](https://vercel.com/docs/drains) to the Log API. They have no APM, so the tools above do not see them; these read the `Log` rows the drain writes (`projectName`, `requestId`, `proxy.*`, and Vercel's `REPORT … Duration: N ms` line).
+
+| Tool | Description |
+|------|-------------|
+| `get_vercel_health` | Per project: requests, 5xx count and rate, cache hit share, function invocations and p50/p95 duration |
+| `get_vercel_errors` | Routes that answered 5xx, and the error/warning messages functions logged |
+| `get_vercel_slow_routes` | Routes ranked by total function time, with calls, average and p95 duration |
+
 ## Prerequisites
 
 - Node.js 18+
