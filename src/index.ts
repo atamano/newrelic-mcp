@@ -22,11 +22,14 @@ function whereVercelProject(project?: string): string {
 // A function invocation ends with Vercel's "REPORT RequestId: … Duration: N ms"
 // line; rows without it are requests served by the proxy (cache hits, redirects).
 const VERCEL_INVOCATION = "message LIKE '%REPORT RequestId%'";
-const VERCEL_DURATION_MS = String.raw`numeric(capture(message, r'.*REPORT RequestId: \S+ Duration: (?P<dur>[0-9.]+) ms.*'))`;
+// (?s): the message is the whole START/END/REPORT block, several lines long.
+const VERCEL_DURATION_MS = String.raw`numeric(capture(message, r'(?s).*REPORT RequestId: \S+ Duration: (?P<dur>[0-9.]+) ms.*'))`;
 // One request can write several rows (middleware, function, console output),
 // so requests are counted by their id, never by rows.
 const VERCEL_REQUESTS = "uniqueCount(requestId)";
 const VERCEL_5XX = `filter(${VERCEL_REQUESTS}, WHERE numeric(proxy.statusCode) >= 500)`;
+// A FACET returns 10 rows unless told otherwise: no project may drop out silently.
+const VERCEL_MAX_PROJECTS = 100;
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -230,7 +233,7 @@ server.registerTool(
 const projectSchema = z
   .string()
   .optional()
-  .describe("Vercel project name, e.g. 'darksquares' (default: every project the drain sends)");
+  .describe("Vercel project name, e.g. 'darksquares' (default: every project the drain sends, up to 100)");
 
 server.registerTool(
   "get_vercel_health",
@@ -245,7 +248,7 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   nrqlHandler(({ project, since }) =>
-    `SELECT ${VERCEL_REQUESTS} AS 'requests', ${VERCEL_5XX} AS 'requests_5xx', ${VERCEL_5XX} * 100 / ${VERCEL_REQUESTS} AS 'error_rate_5xx_pct', filter(${VERCEL_REQUESTS}, WHERE proxy.vercelCache = 'HIT') * 100 / ${VERCEL_REQUESTS} AS 'cache_hit_pct', filter(count(*), WHERE ${VERCEL_INVOCATION}) AS 'function_invocations', filter(percentile(${VERCEL_DURATION_MS}, 50, 95), WHERE ${VERCEL_INVOCATION}) AS 'function_duration_ms' FROM Log ${whereVercelProject(project)} FACET projectName SINCE ${since}`,
+    `SELECT ${VERCEL_REQUESTS} AS 'requests', ${VERCEL_5XX} AS 'requests_5xx', ${VERCEL_5XX} * 100 / ${VERCEL_REQUESTS} AS 'error_rate_5xx_pct', filter(${VERCEL_REQUESTS}, WHERE proxy.vercelCache = 'HIT') * 100 / ${VERCEL_REQUESTS} AS 'cache_hit_pct', filter(count(*), WHERE ${VERCEL_INVOCATION}) AS 'function_invocations', filter(percentile(${VERCEL_DURATION_MS}, 50, 95), WHERE ${VERCEL_INVOCATION}) AS 'function_duration_ms' FROM Log ${whereVercelProject(project)} FACET projectName SINCE ${since} LIMIT ${VERCEL_MAX_PROJECTS}`,
   ),
 );
 
@@ -296,7 +299,7 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   nrqlHandler(({ project, since, limit }) =>
-    `SELECT sum(${VERCEL_DURATION_MS}) AS 'total_ms', count(*) AS 'calls', average(${VERCEL_DURATION_MS}) AS 'avg_ms', percentile(${VERCEL_DURATION_MS}, 95) AS 'p95_ms' FROM Log ${whereVercelProject(project)} AND ${VERCEL_INVOCATION} FACET projectName, proxy.path SINCE ${since} LIMIT ${limit}`,
+    `SELECT sum(${VERCEL_DURATION_MS}) AS 'total_ms', count(*) AS 'calls', average(${VERCEL_DURATION_MS}) AS 'avg_ms', percentile(${VERCEL_DURATION_MS}, 95) AS 'p95_ms' FROM Log ${whereVercelProject(project)} AND ${VERCEL_INVOCATION} FACET projectName, proxy.path ORDER BY sum(${VERCEL_DURATION_MS}) SINCE ${since} LIMIT ${limit}`,
   ),
 );
 
