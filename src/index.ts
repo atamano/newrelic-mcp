@@ -14,6 +14,23 @@ function whereAppName(appName?: string): string {
   return appName ? `WHERE appName = '${escapeNrql(appName)}'` : "";
 }
 
+// Vercel log drain rows carry `projectName`; every other Log row lacks it.
+function whereVercelProject(project?: string): string {
+  return project ? `WHERE projectName = '${escapeNrql(project)}'` : "WHERE projectName IS NOT NULL";
+}
+
+// A function invocation ends with Vercel's "REPORT RequestId: … Duration: N ms"
+// line; rows without it are requests served by the proxy (cache hits, redirects).
+const VERCEL_INVOCATION = "message LIKE '%REPORT RequestId%'";
+// (?s): the message is the whole START/END/REPORT block, several lines long.
+const VERCEL_DURATION_MS = String.raw`numeric(capture(message, r'(?s).*REPORT RequestId: \S+ Duration: (?P<dur>[0-9.]+) ms.*'))`;
+// One request can write several rows (middleware, function, console output),
+// so requests are counted by their id, never by rows.
+const VERCEL_REQUESTS = "uniqueCount(requestId)";
+const VERCEL_5XX = `filter(${VERCEL_REQUESTS}, WHERE numeric(proxy.statusCode) >= 500)`;
+// A FACET returns 10 rows unless told otherwise: no project may drop out silently.
+const VERCEL_MAX_PROJECTS = 100;
+
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -208,6 +225,81 @@ server.registerTool(
   },
   nrqlHandler(({ app_name, since }) =>
     `SELECT count(*) AS 'total_requests', rate(count(*), 1 minute) AS 'rpm', percentage(count(*), WHERE error IS true) AS 'error_rate_pct', average(duration) AS 'avg_response_s', percentile(duration, 50, 95, 99) AS 'percentiles', apdex(duration, 0.5) AS 'apdex' FROM Transaction ${whereAppName(app_name)} SINCE ${since}`,
+  ),
+);
+
+// ── Vercel apps (logs from a Vercel log drain) ─────────────────────────────
+
+const projectSchema = z
+  .string()
+  .optional()
+  .describe("Vercel project name, e.g. 'darksquares' (default: every project the drain sends, up to 100)");
+
+server.registerTool(
+  "get_vercel_health",
+  {
+    title: "Get Vercel App Health",
+    description:
+      "Health of Vercel projects whose logs reach New Relic through a Vercel log drain: requests, 5xx count and rate, share served from the Vercel cache, function invocations and their p50/p95 duration (ms). One row per project. These apps have no APM, so the get_app_health/get_errors tools do not see them.",
+    inputSchema: z.object({
+      project: projectSchema,
+      since: sinceSchema.default("1 day ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+    }),
+    annotations: { readOnlyHint: true },
+  },
+  nrqlHandler(({ project, since }) =>
+    `SELECT ${VERCEL_REQUESTS} AS 'requests', ${VERCEL_5XX} AS 'requests_5xx', ${VERCEL_5XX} * 100 / ${VERCEL_REQUESTS} AS 'error_rate_5xx_pct', filter(${VERCEL_REQUESTS}, WHERE proxy.vercelCache = 'HIT') * 100 / ${VERCEL_REQUESTS} AS 'cache_hit_pct', filter(count(*), WHERE ${VERCEL_INVOCATION}) AS 'function_invocations', filter(percentile(${VERCEL_DURATION_MS}, 50, 95), WHERE ${VERCEL_INVOCATION}) AS 'function_duration_ms' FROM Log ${whereVercelProject(project)} FACET projectName SINCE ${since} LIMIT ${VERCEL_MAX_PROJECTS}`,
+  ),
+);
+
+server.registerTool(
+  "get_vercel_errors",
+  {
+    title: "Get Vercel App Errors",
+    description:
+      "What went wrong on Vercel projects (log drain): the routes that answered 5xx, and the error/warning messages the functions logged, each with a count and its latest occurrence.",
+    inputSchema: z.object({
+      project: projectSchema,
+      since: sinceSchema.default("1 day ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+      limit: limitSchema.default(25).describe("Max rows per list (1-200)"),
+    }),
+    annotations: { readOnlyHint: true },
+  },
+  async ({ project, since, limit }) => {
+    const where = whereVercelProject(project);
+    try {
+      const [routes5xx, loggedErrors] = await Promise.all([
+        client.nrql(
+          `SELECT ${VERCEL_REQUESTS} AS 'requests', latest(timestamp) AS 'latest' FROM Log ${where} AND numeric(proxy.statusCode) >= 500 FACET projectName, proxy.statusCode, proxy.method, proxy.path SINCE ${since} LIMIT ${limit}`,
+        ),
+        client.nrql(
+          `SELECT count(*) AS 'rows', latest(proxy.path) AS 'latest_path', latest(timestamp) AS 'latest' FROM Log ${where} AND level IN ('error', 'fatal', 'warning') FACET projectName, level, substring(message, 0, 300) SINCE ${since} LIMIT ${limit}`,
+        ),
+      ]);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ routes5xx, loggedErrors }, null, 2) }],
+      };
+    } catch (e) {
+      return { content: [{ type: "text", text: `Error: ${errorMessage(e)}` }], isError: true };
+    }
+  },
+);
+
+server.registerTool(
+  "get_vercel_slow_routes",
+  {
+    title: "Get Vercel Slow Routes",
+    description:
+      "Where Vercel functions spend their time (log drain): routes ranked by total function time, with call count, average and p95 duration in ms. Ranking by total keeps one-off slow URLs (a profile page hit twice) from crowding out the routes that matter.",
+    inputSchema: z.object({
+      project: projectSchema,
+      since: sinceSchema.default("1 day ago").describe("Time range, e.g. '1 hour ago', '7 days ago'"),
+      limit: limitSchema.default(20).describe("Max number of routes to return (1-200)"),
+    }),
+    annotations: { readOnlyHint: true },
+  },
+  nrqlHandler(({ project, since, limit }) =>
+    `SELECT sum(${VERCEL_DURATION_MS}) AS 'total_ms', count(*) AS 'calls', average(${VERCEL_DURATION_MS}) AS 'avg_ms', percentile(${VERCEL_DURATION_MS}, 95) AS 'p95_ms' FROM Log ${whereVercelProject(project)} AND ${VERCEL_INVOCATION} FACET projectName, proxy.path ORDER BY sum(${VERCEL_DURATION_MS}) SINCE ${since} LIMIT ${limit}`,
   ),
 );
 
